@@ -24,7 +24,9 @@ composed:
   - email_to_speech      "user@example.com" → "user at example dot com"
   - expand_currency      "$42.50" → "forty-two dollars and fifty cents"
   - expand_percentages   "3.5%" → "three point five percent"
-  - replace_text         Custom substitutions (e.g. "Dr." → "Doctor")
+  - replace_text         Custom substitutions (e.g. "Dr." → "Doctor"), including
+                          phonetic respelling for words ElevenLabs would
+                          otherwise mispronounce.
 
 Run locally:
     python features-text-transforms.py
@@ -100,12 +102,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     # Custom substitution rules applied after all other transforms.
     # Patterns are regular expressions; use re.escape() for literal strings.
+    #
+    # The last rule respells a name phonetically so ElevenLabs pronounces it
+    # correctly. This replaces the deprecated PronunciationDictionaryLocator:
+    # the respelled text is exactly what's sent to (and spoken by) synthesis,
+    # so the alignment-based word-completion tracking still lines up with
+    # what's actually spoken.
     custom_subs = replace_text(
         [
             (r"\bDr\.", "Doctor"),
             (r"\bSt\.", "Street"),
             (r"\bApt\.", "Apartment"),
             (r"\bvs\b", "versus"),
+            (r"(?i)\bSiobhan\b", "shi-VAWN"),
         ]
     )
 
@@ -132,9 +141,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         api_key=os.environ["OPENAI_API_KEY"],
         settings=OpenAILLMService.Settings(
             system_instruction=(
-                "You are a billing support assistant for a telecom company. "
-                "Your responses are spoken aloud. Use natural formatting in your "
-                "answers: currency amounts like $42.50, percentages like 3.5%, "
+                "You are Siobhan, a billing support assistant for Nexora, a telecom "
+                "company. Your responses are spoken aloud. Use natural formatting in "
+                "your answers: currency amounts like $42.50, percentages like 3.5%, "
                 "email addresses like support@example.com, and abbreviations like "
                 "Dr. or St. as you normally would in writing — the voice formatter "
                 "will convert them to natural speech before synthesis."
@@ -176,10 +185,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             {
                 "role": "developer",
                 "content": (
-                    "Greet the user and let them know they've reached billing support. "
-                    "Offer to help with their account balance, recent charges, or "
-                    "payment options. Give a sample balance such as $127.50 due on "
-                    "3/15/2025 and a support email like billing@telecom.example.com."
+                    "Introduce yourself by name and let the caller know they've "
+                    "reached billing support. Offer to help with their account "
+                    "balance, recent charges, or payment options. Give a sample "
+                    "balance such as $127.50 due on 3/15/2025 and a support email "
+                    "like billing@telecom.example.com."
                 ),
             }
         )

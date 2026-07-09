@@ -632,7 +632,11 @@ class ElevenLabsTTSService(WebsocketTTSService):
         if _pronunciation_dictionary_locators is not None:
             warnings.warn(
                 "`pronunciation_dictionary_locators` is deprecated since 1.6.0 and will be "
-                "removed in 2.0.0. Use `text_transforms` -> `replace_text` instead.",
+                "removed in 2.0.0. Use `text_transforms` -> `replace_text` instead. "
+                "Pronunciation dictionary substitutions can rewrite the spoken words in "
+                "ways that no longer match the text sent to synthesis, which breaks the "
+                "alignment-based word-completion tracking used to attribute spoken text "
+                "back to the conversation context.",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -1250,7 +1254,11 @@ class ElevenLabsHttpTTSService(TTSService):
         if _pronunciation_dictionary_locators is not None:
             warnings.warn(
                 "`pronunciation_dictionary_locators` is deprecated since 1.6.0 and will be "
-                "removed in 2.0.0. Use `text_transforms` -> `replace_text` instead.",
+                "removed in 2.0.0. Use `text_transforms` -> `replace_text` instead. "
+                "Pronunciation dictionary substitutions can rewrite the spoken words in "
+                "ways that no longer match the text sent to synthesis, which breaks the "
+                "alignment-based word-completion tracking used to attribute spoken text "
+                "back to the conversation context.",
                 DeprecationWarning,
                 stacklevel=2,
             )

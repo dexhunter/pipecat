@@ -13,51 +13,6 @@ from dataclasses import dataclass
 from pipecat.utils.text.transforms._alnum_utils import advance_by_alnums, normalize
 
 
-def _strip_tag_markup(word: str, in_open_tag: bool) -> tuple[str, bool]:
-    """Strip SSML/XML tag markup from *word*, tracking tags that span words.
-
-    A tag whose opening tag contains internal whitespace (e.g. multiple
-    attributes, as in ElevenLabs' ``<phoneme alphabet="..." ph="...">``) can be
-    reported as several separate word-timestamp tokens by TTS providers that
-    tokenize on whitespace without tag awareness. This walks *word*
-    character-by-character, carrying open/close state across calls so a tag
-    opened in one word and closed in a later one (or an attribute-only word
-    entirely inside an open tag) is still recognised as pure markup.
-
-    Args:
-        word: Raw word token to strip.
-        in_open_tag: Whether a previous word left an unclosed tag open.
-
-    Returns:
-        (content, still_in_open_tag): *word* with all tag markup removed, and
-        whether a tag remains open after processing it.
-    """
-    result = []
-    i, n = 0, len(word)
-    while i < n:
-        if in_open_tag:
-            close = word.find(">", i)
-            if close == -1:
-                i = n
-            else:
-                in_open_tag = False
-                i = close + 1
-        else:
-            open_ = word.find("<", i)
-            if open_ == -1:
-                result.append(word[i:])
-                i = n
-            else:
-                result.append(word[i:open_])
-                close = word.find(">", open_)
-                if close == -1:
-                    in_open_tag = True
-                    i = n
-                else:
-                    i = close + 1
-    return "".join(result), in_open_tag
-
-
 @dataclass(frozen=True)
 class TextSegment:
     """Immutable aligned chunk between original and TTS text.
@@ -113,10 +68,12 @@ class TextSegmentMap:
     segments, both cursors are held until the entire TTS segment has been consumed,
     then jump to the end of the corresponding original segment in one step.
 
-    Callers advance the map word-by-word via :meth:`advance_word`, which also
-    strips SSML tag markup from a raw word-timestamp token, tracking tags whose
-    opening tag spans multiple words (e.g. an SSML tag with several attributes,
-    split on whitespace by some TTS providers' word-timestamp streams).
+    Callers drive the map word-by-word: :meth:`word_belongs_current_segment` asks
+    whether a raw word-timestamp token plausibly continues the remaining TTS
+    text, and :meth:`advance_word` consumes it. Both strip SSML tag markup from
+    the token first, tracking tags whose opening tag spans multiple words (e.g.
+    an SSML tag with several attributes, split on whitespace by some TTS
+    providers' word-timestamp streams).
 
     Example::
 
@@ -150,6 +107,7 @@ class TextSegmentMap:
                 The LLM cursor advances through this text at the same segment
                 boundaries as the user-facing cursor.
         """
+        self._tts_text = tts_text
         self._original_text = original_text
         self._llm_text = llm_text if llm_text is not None else original_text
         self._segments: list[TextSegment] = self._build(tts_text, original_text)
@@ -240,22 +198,151 @@ class TextSegmentMap:
         self._touched_current_segment: bool = False
         self._in_open_tag: bool = False
 
-    def strip_word(self, word: str) -> str:
-        """Return *word* with any SSML tag markup removed, without consuming it.
+    @staticmethod
+    def _strip_word_tags(word: str, in_open_tag: bool) -> tuple[str, bool]:
+        """Strip SSML/XML tag markup from *word*, tracking tags that span words.
 
-        Non-mutating peek variant of :meth:`advance_word`'s stripping step, so
-        callers can decide whether a word belongs here before consuming it.
+        A tag whose opening tag contains internal whitespace (e.g. multiple
+        attributes, as in ElevenLabs' ``<phoneme alphabet="..." ph="...">``) can
+        be reported as several separate word-timestamp tokens by TTS providers
+        that tokenize on whitespace without tag awareness. This walks *word*
+        character-by-character, carrying open/close state across calls so a tag
+        opened in one word and closed in a later one (or an attribute-only word
+        entirely inside an open tag) is still recognised as pure markup.
+
+        Args:
+            word: Raw word token to strip.
+            in_open_tag: Whether a previous word left an unclosed tag open.
+
+        Returns:
+            (content, still_in_open_tag): *word* with all tag markup removed,
+            and whether a tag remains open after processing it.
         """
-        content, _ = _strip_tag_markup(word, self._in_open_tag)
-        return content
+        result = []
+        i, n = 0, len(word)
+        while i < n:
+            if in_open_tag:
+                close = word.find(">", i)
+                if close == -1:
+                    i = n
+                else:
+                    in_open_tag = False
+                    i = close + 1
+            else:
+                open_ = word.find("<", i)
+                if open_ == -1:
+                    result.append(word[i:])
+                    i = n
+                else:
+                    result.append(word[i:open_])
+                    close = word.find(">", open_)
+                    if close == -1:
+                        in_open_tag = True
+                        i = n
+                    else:
+                        i = close + 1
+        return "".join(result), in_open_tag
+
+    def _raw_pos(self) -> int:
+        """Current global offset into ``tts_text``, derived from segment state.
+
+        Sums the full raw length of already-completed segments, then advances
+        into the current segment by its alnum budget consumed so far --
+        naturally staying at a still-open tag's start when that budget is zero
+        (mirrors how ``advance_by_alnums`` skips a complete tag atomically only
+        once given a nonzero budget to reach past it).
+        """
+        pos = sum(len(s.tts) for s in self._segments[: self._seg_idx])
+        if self._seg_idx < len(self._segments):
+            seg = self._segments[self._seg_idx]
+            pos += advance_by_alnums(seg.tts, 0, self._seg_consumed)
+        return pos
+
+    def _remaining_normalized(self) -> str:
+        """Remaining expected normalized alnum content, across all segments."""
+        if self._seg_idx >= len(self._segments):
+            return ""
+        seg = self._segments[self._seg_idx]
+        parts = [normalize(seg.tts)[self._seg_consumed :]]
+        parts.extend(normalize(s.tts) for s in self._segments[self._seg_idx + 1 :])
+        return "".join(parts)
+
+    def word_belongs_current_segment(self, word: str) -> bool:
+        """Return True if *word* plausibly continues the remaining TTS text.
+
+        Strips SSML tag markup first (see :meth:`_strip_word_tags`), accounting
+        for tags whose opening tag spans multiple words. A fragment that is pure
+        tag markup, or picks up mid-tag, always belongs -- it carries no spoken
+        content of its own. Otherwise dispatches on the stripped content:
+
+        - Alnum content: prefix-match against everything still unconsumed,
+          across all remaining segments (not just the current one, since a word
+          can straddle a segment boundary the same way it can straddle a frame
+          boundary).
+        - Symbol/punctuation content (empty after normalization): literal
+          substring search in the remaining raw TTS text, with a fallback for
+          TTS providers that substitute Unicode symbols with ASCII punctuation.
+
+        Used to detect when the TTS provider silently dropped a word-timestamp
+        event: if the incoming word does not match, the caller should
+        force-complete this slot and route the word to the next.
+        """
+        content, _ = self._strip_word_tags(word, self._in_open_tag)
+        normalized = normalize(content)
+        if normalized:
+            remaining = self._remaining_normalized()
+            if not remaining:
+                return False
+            check_len = min(len(normalized), len(remaining))
+            return remaining.startswith(normalized[:check_len])
+        if content != word:
+            # Stripping changed something, so this word was (or continues) tag
+            # markup -- not spoken content -- and always belongs. If nothing
+            # was stripped, it's a genuine symbol/emoji that just happens to
+            # have no alnum content, which still needs the real check below.
+            return True
+        return self._symbol_word_belongs(word)
+
+    def _symbol_word_belongs(self, word: str) -> bool:
+        """Return True if a non-alnum word (emoji, punctuation, symbol) belongs here.
+
+        Two checks are applied in order:
+
+        1. **Literal substring**: search for the raw word in the remaining TTS
+           text. The search window is backed up over any already-consumed
+           trailing punctuation, since that may have been swept past already.
+
+        2. **Symbol substitution fallback**: some TTS providers substitute
+           Unicode symbols with ASCII punctuation in word-timestamp events (e.g.
+           ElevenLabs reports "->" as "-"), so check 1 always fails even though
+           the word belongs here. If alnum content still remains unconsumed and
+           the next non-space character in the TTS text is itself a non-alnum
+           symbol, accept the word as a substitution.
+        """
+        pos = self._raw_pos()
+        search_start = pos
+        while search_start > 0:
+            ch = self._tts_text[search_start - 1]
+            if ch.isalnum() or ch.isspace() or ch == ">":
+                break
+            search_start -= 1
+        if word in self._tts_text[search_start:]:
+            return True
+
+        if self._seg_idx >= len(self._segments):
+            return False
+
+        while pos < len(self._tts_text) and self._tts_text[pos].isspace():
+            pos += 1
+        return pos < len(self._tts_text) and not self._tts_text[pos].isalnum()
 
     def advance_word(self, word: str) -> str:
         """Strip tag markup from *word*, commit the tag state, and advance.
 
-        Combines :meth:`strip_word` with the internal char-count advance: strips
-        *word* (tracking any tag left open for the next call), then advances
-        cursors by the resulting content's alphanumeric character count -- zero
-        for a word that is entirely tag markup.
+        Strips *word* (tracking any tag left open for the next call, see
+        :meth:`_strip_word_tags`), then advances cursors by the resulting
+        content's alphanumeric character count -- zero for a word that is
+        entirely tag markup.
 
         Args:
             word: Raw TTS word-timestamp token.
@@ -264,7 +351,7 @@ class TextSegmentMap:
             *word* with tag markup removed. Callers should use this in place of
             the raw word for their own alnum accounting.
         """
-        content, self._in_open_tag = _strip_tag_markup(word, self._in_open_tag)
+        content, self._in_open_tag = self._strip_word_tags(word, self._in_open_tag)
         self._advance(len(normalize(content)))
         return content
 

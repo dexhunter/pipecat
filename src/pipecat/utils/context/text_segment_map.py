@@ -18,6 +18,11 @@ def strip_markup(text: str) -> str:
 
     This is intentionally syntax-based, not tag-name based. It treats anything
     between '<' and '>' as markup and preserves text outside markup.
+
+    Module-level rather than private to either class below: both
+    :class:`TextSegment` and :class:`TextSegmentMap` use it, and so does
+    :class:`~pipecat.utils.context.word_completion_tracker.WordCompletionTracker`
+    (to default ``user_facing_text`` to a tag-free string).
     """
     result = []
     in_tag = False
@@ -117,23 +122,42 @@ class TextSegment:
 class TextSegmentMap:
     """Maps cursor positions between transformed TTS text and original text.
 
-    Tracks a single raw-text cursor (``_seg_raw_pos``) into the current
-    segment's ``tts`` text. Each incoming word-timestamp token is matched
-    against the segment's remaining raw text -- literally, or (as a stateless
-    fallback) with markup stripped from both sides -- so the same mechanism
-    drives segment completion and cursor advancement without needing to parse
-    tag structure out of the token stream.
+    Built once from two texts that may differ in alphanumeric content due to text
+    transforms (e.g. currency expansion), or only in surrounding markup (e.g. an
+    SSML phoneme tag). Tracks a single raw-text cursor (``_seg_raw_pos``) through
+    the current segment's ``tts`` text and exposes the corresponding position in
+    the original text.
 
-    For unchanged segments, ``user_facing_pos``/``llm_pos`` advance
-    proportionally to the alphanumeric content of each consumed raw span. For
-    transformed segments (e.g. a phoneme-wrapped word, or ``"$42.50"`` ->
-    ``"forty two dollars and fifty cents"``), those cursors are held until the
-    segment's entire raw text has been matched, then jump to the end of the
-    corresponding original span in one step.
+    For unchanged segments, both cursors advance proportionally to the
+    alphanumeric content of each consumed raw span. For transformed segments,
+    both cursors are held until the entire TTS segment's raw text has been
+    matched, then jump to the end of the corresponding original segment in one
+    step.
 
     Callers drive the map word-by-word: :meth:`word_belongs_current_segment`
     asks whether a raw word-timestamp token plausibly continues the remaining
-    TTS text, and :meth:`advance_word` consumes it.
+    TTS text, and :meth:`advance_word` consumes it. Both match the token
+    against the segment's remaining raw text directly -- literally, or (as a
+    stateless fallback) with markup stripped from both sides -- so a token that
+    is a fragment of a still-open SSML tag (e.g. an attribute-only word from a
+    multi-attribute tag some TTS providers split across several word-timestamp
+    events) is handled the same way as any other, without needing to parse tag
+    structure out of the token stream.
+
+    Example::
+
+        # "$42.50" was expanded to "forty two dollars and fifty cents"
+        smap = TextSegmentMap(
+            "Your balance is forty two dollars and fifty cents",
+            "Your balance is $42.50",
+        )
+        for word in ["Your", "balance", "is"]:
+            smap.advance_word(word)   # unchanged segment
+        for word in ["forty", "two", "dollars", "and", "fifty"]:
+            smap.advance_word(word)   # transformed segment, cursors held
+        smap.advance_word("cents")    # segment completes, cursors jump
+        assert smap.last_completed_segment.original == "$42.50"
+        assert not smap.in_transformed_segment
     """
 
     def __init__(
@@ -239,12 +263,9 @@ class TextSegmentMap:
         self._llm_pos: int = 0
         self._last_completed: TextSegment | None = None
         self._last_overflow: str | None = None
-        self._touched_current_segment: bool = False
 
     @staticmethod
-    def _classify_hop(
-        segment_remaining: str, remaining_word: str, seg: TextSegment
-    ) -> tuple[str, int, int]:
+    def _classify_hop(segment_remaining: str, remaining_word: str) -> tuple[str, int, int]:
         """Classify how *remaining_word* relates to *segment_remaining*.
 
         Purely positional/textual -- no tag-name parsing or cross-call state.
@@ -278,19 +299,22 @@ class TextSegmentMap:
         - ``("fallback", 0, 0)``: nothing above matched (e.g. a TTS provider
           symbol substitution).
         """
-        if segment_remaining.startswith(remaining_word):
-            return "found", 0, len(remaining_word)
-        if remaining_word.startswith(segment_remaining):
-            return "consume", 0, len(segment_remaining)
+
+        def match(candidate: str, skip: int) -> tuple[str, int, int] | None:
+            if candidate.startswith(remaining_word):
+                return "found", skip, len(remaining_word)
+            if candidate and remaining_word.startswith(candidate):
+                return "consume", 0, len(candidate)
+            return None
 
         stripped = segment_remaining.lstrip()
         skip = len(segment_remaining) - len(stripped)
 
-        if skip:
-            if stripped.startswith(remaining_word):
-                return "found", skip, len(remaining_word)
-            if stripped and remaining_word.startswith(stripped):
-                return "consume", 0, len(stripped)
+        result = match(segment_remaining, 0)
+        if result is None and skip:
+            result = match(stripped, skip)
+        if result is not None:
+            return result
 
         clean_word = strip_markup(remaining_word)
         if clean_word and strip_markup(stripped).startswith(clean_word):
@@ -355,7 +379,7 @@ class TextSegmentMap:
             seg = self._segments[self._seg_idx]
             old_pos = self._seg_raw_pos
             segment_remaining = seg.tts[old_pos:]
-            kind, skip, value = self._classify_hop(segment_remaining, remaining_word, seg)
+            kind, skip, value = self._classify_hop(segment_remaining, remaining_word)
 
             if kind == "found":
                 self._commit_raw_span(seg, old_pos + skip + value)
@@ -390,12 +414,9 @@ class TextSegmentMap:
         """
         self._last_completed = None
         self._last_overflow = None
-        seg_idx_before = self._seg_idx
 
         if word:
             self._advance_raw(word)
-
-        self._touched_current_segment = self._seg_idx == seg_idx_before
 
     def word_belongs_current_segment(self, word: str) -> bool:
         """Return True if *word* plausibly continues the remaining TTS text.
@@ -431,9 +452,8 @@ class TextSegmentMap:
         remaining_word = word
 
         while remaining_word and seg_idx < len(self._segments):
-            seg = self._segments[seg_idx]
-            segment_remaining = seg.tts[raw_pos:]
-            kind, _skip, value = self._classify_hop(segment_remaining, remaining_word, seg)
+            segment_remaining = self._segments[seg_idx].tts[raw_pos:]
+            kind, _skip, value = self._classify_hop(segment_remaining, remaining_word)
 
             if kind == "found":
                 return True
@@ -531,7 +551,7 @@ class TextSegmentMap:
             return False
 
         seg = self._segments[self._seg_idx]
-        return seg.is_transformed and (self._seg_raw_pos > 0 or self._touched_current_segment)
+        return seg.is_transformed and self._seg_raw_pos > 0
 
     @property
     def last_completed_segment(self) -> TextSegment | None:

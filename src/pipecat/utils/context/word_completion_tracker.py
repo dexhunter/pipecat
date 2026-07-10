@@ -11,8 +11,7 @@ import unicodedata
 
 from loguru import logger
 
-from pipecat.utils.context.text_segment_map import TextSegmentMap
-from pipecat.utils.text.transforms._alnum_utils import advance_by_alnums as _advance_by_alnums_fn
+from pipecat.utils.context.text_segment_map import TextSegmentMap, strip_markup
 from pipecat.utils.text.transforms._alnum_utils import normalize as _normalize_fn
 
 
@@ -84,17 +83,23 @@ class WordCompletionTracker:
                 into it so callers can retrieve the spoken and unspoken portions in
                 terms of user-visible text via ``get_accumulated_user_facing_text()``
                 and ``get_remaining_user_facing_text()``. Defaults to ``tts_text``
-                when not provided.
+                with markup stripped when not provided -- user-facing text should
+                never carry synthesis tags.
         """
         # _tts_text is the original tts_text before normalization.
         self._tts_text = tts_text
 
         # _user_facing_text is the original text returned to the user (e.g. via RTVI).
-        # Falls back to tts_text when not provided so this cursor is always valid.
+        # Falls back to tts_text (markup stripped) when not provided so this cursor
+        # is always valid, and so the segment map still splits out a non-tagged
+        # prefix/suffix around any markup instead of treating the whole identical
+        # string as one big segment.
         # _user_facing_pos is a cursor into it, kept in sync with the segment map
         # except when a slot is force-completed (which the segment map never
         # observes, since it manually jumps this cursor to the end).
-        self._user_facing_text: str = user_facing_text if user_facing_text is not None else tts_text
+        self._user_facing_text: str = (
+            user_facing_text if user_facing_text is not None else strip_markup(tts_text)
+        )
         self._user_facing_pos = 0
 
         # _llm_text is the original LLM-produced text (with pattern delimiters like
@@ -164,21 +169,6 @@ class WordCompletionTracker:
         while i > 0 and unicodedata.category(text[i - 1]).startswith("P"):
             i -= 1
         return text[:i]
-
-    @staticmethod
-    def _advance_by_alnums(text: str, start_pos: int, n: int) -> int:
-        """Return the position in *text* after advancing past *n* alphanumeric chars.
-
-        Delegates to :func:`pipecat.utils.text.transforms._alnum_utils.advance_by_alnums`.
-        Kept as a static method for backward compatibility with callers that reference
-        ``WordCompletionTracker._advance_by_alnums`` directly.
-
-        Args:
-            text: The source text to scan.
-            start_pos: Starting position in *text*.
-            n: Number of alphanumeric characters to consume.
-        """
-        return _advance_by_alnums_fn(text, start_pos, n)
 
     def add_word_and_check_complete(self, word: str) -> bool:
         """Record a spoken word from a word-timestamp event.

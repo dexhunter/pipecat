@@ -85,7 +85,8 @@ class WordCompletionTracker:
                 with markup stripped when not provided -- user-facing text should
                 never carry synthesis tags.
         """
-        # _tts_text is the original tts_text before normalization.
+        # _tts_text is the raw text sent to TTS (may carry SSML tags). The segment
+        # map's raw_pos indexes into it; the get_*_tts_text accessors slice it.
         self._tts_text = tts_text
 
         # _user_facing_text is the original text returned to the user (e.g. via RTVI).
@@ -107,6 +108,10 @@ class WordCompletionTracker:
         self._llm_text = llm_text
         self._llm_pos = 0
 
+        # Per-call outputs: recomputed on every add_word_and_check_complete and
+        # read back through the get_* accessors. _frame_word is the part of the
+        # last word belonging to this frame; _overflow_word is the part that
+        # spilled into the next frame; _llm_consumed is the llm_text span it maps to.
         self._overflow_word: str | None = None
         self._llm_consumed: str | None = None
         self._frame_word: str | None = None
@@ -214,25 +219,11 @@ class WordCompletionTracker:
             self._frame_word = self._tts_text[self._segment_map.raw_pos :]
             self._user_facing_pos = len(self._user_facing_text)
             if self._llm_text is not None:
+                # Sweep all remaining llm_text so nothing is lost, then guard
+                # against a tts_text/llm_text desync (see the helper).
                 self._llm_consumed = self._llm_text[self._llm_pos :]
                 self._llm_pos = len(self._llm_text)
-                # This should not happen: force-complete sweeps all remaining
-                # llm_text, so the span must contain the frame word (trailing
-                # punctuation stripped, since some TTS services add it to the
-                # raw word). If it doesn't, tts_text and llm_text are out of
-                # sync in an unexpected way — discard rather than returning a
-                # corrupt span. Compared case- and connector-insensitively
-                # (casefolded, hyphens/spaces collapsed) so a case-only or
-                # hyphen-vs-space replacement isn't mistaken for a desync.
-                word_without_punctuation = self._remove_trailing_punctuation(self._frame_word)
-                if word_without_punctuation and self._fold_for_comparison(
-                    word_without_punctuation
-                ) not in self._fold_for_comparison(self._llm_consumed):
-                    logger.warning(
-                        f"WordCompletionTracker: force-complete llm_consumed {repr(self._llm_consumed)!s} "
-                        f"does not contain frame_word {repr(self._frame_word)!s}, discarding"
-                    )
-                    self._llm_consumed = None
+                self._discard_llm_span_if_frame_word_missing()
             self._force_completed = True
             self._overflow_word = word
             return True
@@ -250,68 +241,78 @@ class WordCompletionTracker:
         self._llm_pos = self._segment_map.llm_pos
 
         if self._llm_text is not None:
-            if self.is_complete:
-                # Final word: sweep all remaining llm_text from prev_llm_pos so
-                # the completing word's own span is included along with any closing
-                # tags (e.g. </card>) that follow it.
-                self._llm_consumed = self._llm_text[prev_llm_pos:]
-                self._llm_pos = len(self._llm_text)
-                # Validate: the sweep must contain the frame word (safeguard for
-                # symbol/emoji words that complete a frame whose llm_text was already
-                # exhausted and does not include them). Skip this check when the
-                # completing word finishes a transformed segment — the spoken word
-                # (e.g. "dollars") won't appear verbatim in the original ("$5").
-                # Otherwise compared case- and connector-insensitively, so a
-                # case-only or hyphen-vs-space replacement isn't discarded.
-                completed = self._segment_map.last_completed_segment
-                word_without_punctuation = self._remove_trailing_punctuation(self._frame_word)
-                if (
-                    word_without_punctuation
-                    and (completed is None or not completed.is_transformed)
-                    and self._fold_for_comparison(word_without_punctuation)
-                    not in self._fold_for_comparison(self._llm_consumed)
-                ):
-                    logger.warning(
-                        f"WordCompletionTracker: llm_consumed {repr(self._llm_consumed)!s} "
-                        f"does not contain frame_word {repr(self._frame_word)!s}, discarding"
-                    )
-                    self._llm_consumed = None
-            elif self._segment_map.in_transformed_segment:
-                # Mid transformed segment: suppress per-word attribution.
-                self._llm_consumed = None
-            elif self._llm_pos == prev_llm_pos and self._segment_map.last_completed_segment is None:
-                # Non-alnum word (emoji, punctuation, symbol) that made no cursor
-                # progress and didn't complete a segment. Consume the raw word from
-                # llm_text directly, skipping any leading spaces that belong to the
-                # previous token's span.
-                start = self._llm_pos
-                while start < len(self._llm_text) and self._llm_text[start].isspace():
-                    start += 1
-                end = start + len(word)
-                self._llm_consumed = self._llm_text[start:end]
-                self._llm_pos = end
-            else:
-                # Span from prev position to new position covers the consumed
-                # text — including a zero-budget segment (e.g. an inline IPA
-                # substitution) that just completed via this word, since llm_pos
-                # was already synced from its jump above.
-                self._llm_consumed = self._llm_text[prev_llm_pos : self._llm_pos]
-                completed = self._segment_map.last_completed_segment
-                if completed is None or not completed.is_transformed:
-                    # Unchanged segment: validate the span contains the frame
-                    # word, case- and connector-insensitively so a case-only or
-                    # hyphen-vs-space replacement isn't discarded.
-                    word_without_punctuation = self._remove_trailing_punctuation(self._frame_word)
-                    if word_without_punctuation and self._fold_for_comparison(
-                        word_without_punctuation
-                    ) not in self._fold_for_comparison(self._llm_consumed):
-                        logger.warning(
-                            f"WordCompletionTracker: llm_consumed {repr(self._llm_consumed)!s} "
-                            f"does not contain frame_word {repr(self._frame_word)!s}, discarding"
-                        )
-                        self._llm_consumed = None
+            self._attribute_llm_consumed(word, prev_llm_pos)
 
         return self.is_complete
+
+    def _attribute_llm_consumed(self, word: str, prev_llm_pos: int) -> None:
+        """Set ``_llm_consumed`` to the llm_text span the just-advanced word maps to.
+
+        Only called when ``llm_text`` was provided. Four cases:
+
+        - **Frame completed**: sweep everything from *prev_llm_pos* to the end so
+          the completing word's span plus any trailing closing tags (e.g.
+          ``</card>``) are included.
+        - **Mid transformed segment**: attribution is suppressed (``None``) --
+          only the word that completes the segment carries its original text.
+        - **Non-alnum word** (emoji/punctuation) that moved no cursor and
+          completed no segment: consume its raw characters from ``llm_text``
+          directly, skipping leading spaces owned by the previous token.
+        - **Otherwise**: the span from *prev_llm_pos* to the new llm cursor
+          (covers a normal word, or a zero-budget segment that completed via this
+          word since ``llm_pos`` was already synced from its jump).
+
+        Except mid-transformed-segment, the span is validated against the frame
+        word and discarded on a desync (see
+        :meth:`_discard_llm_span_if_frame_word_missing`). The validation is
+        skipped when the completing word finished a transformed segment, since
+        the spoken word (e.g. ``"dollars"``) won't appear verbatim in the
+        original (e.g. ``"$5"``).
+        """
+        assert self._llm_text is not None
+        completed = self._segment_map.last_completed_segment
+
+        if self.is_complete:
+            self._llm_consumed = self._llm_text[prev_llm_pos:]
+            self._llm_pos = len(self._llm_text)
+            if completed is None or not completed.is_transformed:
+                self._discard_llm_span_if_frame_word_missing()
+        elif self._segment_map.in_transformed_segment:
+            self._llm_consumed = None
+        elif self._llm_pos == prev_llm_pos and completed is None:
+            start = self._llm_pos
+            while start < len(self._llm_text) and self._llm_text[start].isspace():
+                start += 1
+            end = start + len(word)
+            self._llm_consumed = self._llm_text[start:end]
+            self._llm_pos = end
+        else:
+            self._llm_consumed = self._llm_text[prev_llm_pos : self._llm_pos]
+            if completed is None or not completed.is_transformed:
+                self._discard_llm_span_if_frame_word_missing()
+
+    def _discard_llm_span_if_frame_word_missing(self) -> None:
+        """Drop ``_llm_consumed`` if it doesn't contain the current frame word.
+
+        A safeguard against ``tts_text`` and ``llm_text`` drifting out of sync:
+        the span attributed to a word should contain that word. Compared case-
+        and connector-insensitively (casefolded, hyphens/spaces collapsed) so a
+        case-only (``"SQL"`` vs ``"sql"``) or hyphen-vs-space replacement isn't
+        mistaken for a desync. An all-punctuation frame word (nothing to match)
+        is left alone.
+        """
+        frame_word = self._remove_trailing_punctuation(self._frame_word or "")
+        if not frame_word:
+            return
+        if self._fold_for_comparison(frame_word) in self._fold_for_comparison(
+            self._llm_consumed or ""
+        ):
+            return
+        logger.warning(
+            f"WordCompletionTracker: llm_consumed {repr(self._llm_consumed)!s} "
+            f"does not contain frame_word {repr(self._frame_word)!s}, discarding"
+        )
+        self._llm_consumed = None
 
     def word_belongs_here(self, word: str) -> bool:
         """Return True if this word plausibly belongs to the remaining TTS text.
@@ -428,7 +429,7 @@ class WordCompletionTracker:
         return self._force_completed or self._segment_map.is_complete
 
     def reset(self):
-        """Reset received word accumulation without changing the expected text."""
+        """Reset all cursors and per-call outputs without changing the expected texts."""
         self._user_facing_pos = 0
         self._llm_pos = 0
         self._overflow_word = None

@@ -149,29 +149,36 @@ class _Hop:
 
 
 class TextSegmentMap:
-    """Maps cursor positions between transformed TTS text and original text.
+    """Maps cursor positions across three parallel texts as TTS words stream in.
 
-    Built once from two texts that may differ in alphanumeric content due to text
-    transforms (e.g. currency expansion), or only in surrounding markup (e.g. an
-    SSML phoneme tag). Tracks a single raw-text cursor (``_seg_raw_pos``) through
-    the current segment's ``tts`` text and exposes the corresponding position in
-    the original text.
+    The three texts describe the same utterance at different stages:
 
-    For unchanged segments, both cursors advance proportionally to the
-    alphanumeric content of each consumed raw span. For transformed segments,
-    both cursors are held until the entire TTS segment's raw text has been
-    matched, then jump to the end of the corresponding original segment in one
-    step.
+    - ``tts_text``: what was sent to the TTS service (may carry SSML markup and
+      text transforms, e.g. ``"forty two dollars and fifty cents"``).
+    - ``original_text``: the user-facing string (no markup/transforms, e.g.
+      ``"$42.50"``).
+    - ``llm_text``: the LLM-produced string, which may add delimiters (e.g.
+      ``<card>$42.50</card>``); defaults to ``original_text``.
+
+    Built once by diffing ``tts_text`` against ``original_text`` into aligned
+    :class:`TextSegment` chunks. A single cursor drives everything -- ``raw_pos``,
+    the position reached in ``tts_text`` as words are consumed. The
+    ``user_facing_pos`` and ``llm_pos`` cursors are derived from it:
+
+    - Across an **unchanged** segment they advance proportionally, char for char.
+    - Across a **transformed** segment (alnum content, tokenization, or markup
+      differs) they are held until the segment's entire raw text is consumed,
+      then jump to the end of its original span in one step -- the transform is
+      atomic, so there is no meaningful mid-segment original position.
 
     Callers drive the map word-by-word: :meth:`word_belongs_current_segment`
     asks whether a raw word-timestamp token plausibly continues the remaining
-    TTS text, and :meth:`advance_word` consumes it. Both match the token
-    against the segment's remaining raw text directly -- literally, or (as a
-    stateless fallback) with markup stripped from both sides -- so a token that
-    is a fragment of a still-open SSML tag (e.g. an attribute-only word from a
+    TTS text, and :meth:`advance_word` consumes it. Both match the token against
+    the segment's remaining raw text directly -- literally, or (as a stateless
+    fallback) with markup stripped from both sides -- so a token that is a
+    fragment of a still-open SSML tag (e.g. an attribute-only word from a
     multi-attribute tag some TTS providers split across several word-timestamp
-    events) is handled the same way as any other, without needing to parse tag
-    structure out of the token stream.
+    events) needs no special tag parsing.
 
     Example::
 

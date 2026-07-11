@@ -9,6 +9,7 @@
 import difflib
 import re
 from dataclasses import dataclass
+from enum import Enum, auto
 
 from pipecat.utils.text.transforms._alnum_utils import advance_by_alnums, normalize
 
@@ -117,6 +118,38 @@ class TextSegment:
     def original_alnum_count(self) -> int:
         """Number of alphanumeric characters in the original side of this segment."""
         return len(normalize(self.original))
+
+
+class _HopKind(Enum):
+    """How an incoming word relates to the current segment's remaining raw text."""
+
+    PLACED = auto()  # word fits within this segment; stop here
+    CROSSES = auto()  # word runs past this segment; drain it and carry the remainder
+    EXHAUSTED = auto()  # no spoken content left here; drain it, keep the whole word
+    NO_MATCH = auto()  # word doesn't belong here; nudge past leading punctuation, stop
+
+
+@dataclass(frozen=True)
+class _Hop:
+    """Result of matching one word against one segment.
+
+    Produced by :meth:`TextSegmentMap._classify_hop` and consumed by the segment
+    walk in :meth:`TextSegmentMap._advance_raw` (and its read-only twin
+    :meth:`TextSegmentMap._word_matches_remaining`).
+
+    Parameters:
+        kind: Which relationship holds.
+        seg_chars: Raw chars consumed within this segment -- the matched span for
+            ``PLACED``, the leading non-alphanumeric nudge for ``NO_MATCH``; 0 for
+            the draining kinds (``CROSSES``/``EXHAUSTED``), which always drain the
+            whole segment.
+        word_chars: Chars trimmed off the front of the word before continuing to
+            the next segment. Meaningful for ``CROSSES``; 0 otherwise.
+    """
+
+    kind: _HopKind
+    seg_chars: int = 0
+    word_chars: int = 0
 
 
 class TextSegmentMap:
@@ -265,95 +298,92 @@ class TextSegmentMap:
         self._last_overflow: str | None = None
 
     @staticmethod
-    def _classify_hop(segment_remaining: str, remaining_word: str) -> tuple[str, int, int]:
-        """Classify how *remaining_word* relates to *segment_remaining*.
+    def _classify_hop(segment_remaining: str, remaining_word: str) -> _Hop:
+        """Decide where *remaining_word* goes against this segment's remaining raw text.
 
-        Purely positional/textual -- no tag-name parsing or cross-call state.
-        Returns a ``(kind, skip, value)`` tuple:
+        Purely positional/textual -- no tag-name parsing or cross-call state. The
+        word is checked with three matching strategies, in order:
 
-        - ``("found", skip, raw_len)``: the whole word is matched inside this
-          segment, after skipping *skip* leading raw chars; the match spans
-          *raw_len* raw chars from there. Tried first against the segment's
-          remaining text as-is (*skip* 0 -- e.g. a TTS provider whose word
-          tokens carry their own leading/trailing whitespace, like Inworld's
-          ``" world"``), then, if that fails, against it with leading
-          whitespace stripped (*skip* > 0 -- the more common case where the
-          word omits the separating space); and finally by comparing both
-          sides with markup stripped too (needed when a TTS provider wraps
-          the word-timestamp token in tags that never appear in ``tts_text``,
-          or vice versa; recomputed fresh each call, no persisted tag state).
-        - ``("consume", 0, trim)``: the segment's remaining raw text (as-is,
-          or with leading whitespace stripped) is a prefix of the word --
-          drain the segment and trim *trim* chars off the front of the word
-          before continuing into the next segment.
-        - ``("consume", 0, 0)``: nothing above matched, and nothing more can be
-          spoken in this segment anyway -- its *remaining* raw text has zero
-          alphanumeric content, whether because the segment itself carries
-          none at all (e.g. a self-closing ``<break/>`` tag) or because only
-          trailing whitespace/punctuation is left after everything
-          alphanumeric has already been consumed. Should be drained so the
-          word gets a chance to match the next segment instead. Checked only
-          after the match attempts above, so a word that *does* literally
-          match trailing zero-alnum content (e.g. an emoji) is still found
-          there rather than skipped over.
-        - ``("fallback", 0, 0)``: nothing above matched (e.g. a TTS provider
-          symbol substitution).
+        1. Literal, as-is: for providers whose word tokens carry their own
+           surrounding whitespace (e.g. Inworld's ``" world"``).
+        2. Literal, with the segment's leading whitespace stripped: the common
+           case where the word omits the separating space.
+        3. Markup-stripped on both sides: for a provider that wraps the word
+           token in tags absent from ``tts_text`` (or vice versa). Recomputed
+           fresh each call -- no persisted tag state.
+
+        Strategies 1 and 2 yield :attr:`_HopKind.PLACED` (word fits inside this
+        segment) or :attr:`_HopKind.CROSSES` (the segment's remaining text is
+        only a prefix of the word, which spills into the next segment). Strategy
+        3 only yields ``PLACED``.
+
+        If none match, the outcome is structural:
+
+        - :attr:`_HopKind.EXHAUSTED` when no alphanumeric content is left to
+          speak here (a self-closing ``<break/>`` tag, or only trailing
+          whitespace/punctuation): drain the segment so the word can try the
+          next one. Checked only after the match attempts, so a word that *does*
+          literally match trailing non-alnum content (e.g. an emoji) is still
+          found here rather than skipped over.
+        - :attr:`_HopKind.NO_MATCH` otherwise (e.g. a provider symbol
+          substitution): the word doesn't belong here, so ``seg_chars`` carries a
+          nudge past the segment's leading run of non-alphanumeric chars only --
+          never past real spoken content.
         """
-
-        def match(candidate: str, skip: int) -> tuple[str, int, int] | None:
-            if candidate.startswith(remaining_word):
-                return "found", skip, len(remaining_word)
-            if candidate and remaining_word.startswith(candidate):
-                return "consume", 0, len(candidate)
-            return None
-
         stripped = segment_remaining.lstrip()
-        skip = len(segment_remaining) - len(stripped)
+        lead_ws = len(segment_remaining) - len(stripped)
 
-        result = match(segment_remaining, 0)
-        if result is None and skip:
-            result = match(stripped, skip)
-        if result is not None:
-            return result
+        # Strategies 1 and 2: literal match, as-is then whitespace-stripped.
+        candidates = [(segment_remaining, 0)]
+        if lead_ws:
+            candidates.append((stripped, lead_ws))
+        for candidate, offset in candidates:
+            if candidate.startswith(remaining_word):
+                return _Hop(_HopKind.PLACED, seg_chars=offset + len(remaining_word))
+            if candidate and remaining_word.startswith(candidate):
+                return _Hop(_HopKind.CROSSES, word_chars=len(candidate))
 
+        # Strategy 3: markup-stripped match.
         clean_word = strip_markup(remaining_word)
         if clean_word and strip_markup(stripped).startswith(clean_word):
-            return "found", skip, _raw_len_for_clean_chars(stripped, len(clean_word))
+            raw_len = _raw_len_for_clean_chars(stripped, len(clean_word))
+            return _Hop(_HopKind.PLACED, seg_chars=lead_ws + raw_len)
 
+        # Nothing spoken left here: drain so the word can try the next segment.
         if not normalize(segment_remaining):
-            return "consume", 0, 0
+            return _Hop(_HopKind.EXHAUSTED)
 
-        return "fallback", 0, 0
+        # Foreign token: nudge past leading punctuation only, then stop.
+        nudge = 0
+        while nudge < len(segment_remaining) and not segment_remaining[nudge].isalnum():
+            nudge += 1
+        return _Hop(_HopKind.NO_MATCH, seg_chars=nudge)
 
     def _commit_raw_span(self, seg: TextSegment, new_pos: int) -> None:
-        """Apply raw progress on *seg* up to *new_pos*, advancing cursors.
+        """Advance the raw cursor to *new_pos* in *seg*, moving the semantic cursors.
 
         For an unchanged segment, ``user_facing_pos``/``llm_pos`` advance
-        proportionally to the alphanumeric content of the newly-consumed span.
-        Once *new_pos* reaches the end of the segment's raw text, the segment
-        completes: a transformed segment's cursors jump to the end of its
-        original span; an unchanged segment's cursors are already there from
-        the proportional advance above (never snapped to ``original_end``, to
-        avoid overshooting when a segment ends in trailing whitespace).
+        proportionally to the alphanumeric content just consumed -- never snapped
+        to ``original_end`` (which would overshoot a segment ending in trailing
+        whitespace). A transformed segment holds those cursors until it fully
+        completes, then jumps them to the end of its original span in one step.
         """
-        consumed_span = seg.tts[self._seg_raw_pos : new_pos]
-        self._seg_raw_pos = new_pos
-
-        if not seg.is_transformed:
-            n_alnum = len(normalize(consumed_span))
+        if seg.is_transformed:
+            # A trailing markup-only remainder (e.g. a closing tag) never arrives
+            # as its own word-timestamp event, so once no spoken content is left
+            # after *new_pos*, fold it in and let the segment complete. (Unchanged
+            # segments don't get this: a trailing symbol/emoji there is a real
+            # output position that IS expected to arrive as its own word.)
+            if not normalize(seg.tts[new_pos:]):
+                new_pos = len(seg.tts)
+        else:
+            n_alnum = len(normalize(seg.tts[self._seg_raw_pos : new_pos]))
             self._user_facing_pos = advance_by_alnums(
                 self._original_text, self._user_facing_pos, n_alnum
             )
             self._llm_pos = advance_by_alnums(self._llm_text, self._llm_pos, n_alnum)
-        elif not normalize(seg.tts[new_pos:]):
-            # Transformed segment: a trailing markup-only remainder (e.g. a
-            # closing tag) will never arrive as its own word -- TTS providers
-            # don't emit a separate word-timestamp event for it. Fold it into
-            # this call so the segment still completes. (Unchanged segments
-            # don't get this treatment: a trailing symbol/emoji there is a real
-            # output position and IS expected to arrive as its own word.)
-            new_pos = len(seg.tts)
-            self._seg_raw_pos = new_pos
+
+        self._seg_raw_pos = new_pos
 
         if new_pos >= len(seg.tts):
             if seg.is_transformed:
@@ -378,28 +408,24 @@ class TextSegmentMap:
         while remaining_word and self._seg_idx < len(self._segments):
             seg = self._segments[self._seg_idx]
             old_pos = self._seg_raw_pos
-            segment_remaining = seg.tts[old_pos:]
-            kind, skip, value = self._classify_hop(segment_remaining, remaining_word)
+            hop = self._classify_hop(seg.tts[old_pos:], remaining_word)
 
-            if kind == "found":
-                self._commit_raw_span(seg, old_pos + skip + value)
+            if hop.kind is _HopKind.NO_MATCH:
+                # Foreign token (e.g. a provider symbol substitution): move the
+                # raw cursor past the leading punctuation only -- never the
+                # semantic cursors -- and stop.
+                self._seg_raw_pos = old_pos + hop.seg_chars
                 return
 
-            if kind == "consume":
-                self._commit_raw_span(seg, len(seg.tts))
-                if value:
-                    remaining_word = remaining_word[value:]
-                continue
+            if hop.kind is _HopKind.PLACED:
+                # Word sits inside this segment; advance to the matched end and stop.
+                self._commit_raw_span(seg, old_pos + hop.seg_chars)
+                return
 
-            # Fallback: nudge past this segment's leading run of non-alnum raw
-            # chars only -- never past real (alnum) content -- so a provider
-            # symbol substitution (e.g. "->" reported as "-") is absorbed
-            # without risking eating an unspoken word.
-            skip_len = 0
-            while skip_len < len(segment_remaining) and not segment_remaining[skip_len].isalnum():
-                skip_len += 1
-            self._seg_raw_pos = old_pos + skip_len
-            return
+            # CROSSES or EXHAUSTED: drain the whole segment and carry whatever
+            # part of the word it didn't account for into the next one.
+            self._commit_raw_span(seg, len(seg.tts))
+            remaining_word = remaining_word[hop.word_chars :]
 
         if remaining_word:
             self._last_overflow = remaining_word
@@ -435,14 +461,12 @@ class TextSegmentMap:
         return False
 
     def _word_matches_remaining(self, word: str) -> bool:
-        """Dry run of :meth:`_advance_raw`'s matching loop; does not mutate state.
+        """Read-only replay of :meth:`_advance_raw`'s segment walk; mutates nothing.
 
-        Returns True once a "found" hop occurs (word fully matches, whether
-        entirely within the current segment or a legitimate straddle across
-        further segments that get fully drained), or once such a straddle
-        exhausts every remaining segment. Returns False only when the map was
-        already exhausted before this call, or a hop can't be classified as
-        anything but a fallback (no recognizable match at all).
+        Returns True once the word is PLACED (fits within the current segment, or
+        CROSSES through fully-drained segments into one that places it), or once a
+        straddle drains every remaining segment. Returns False when the map is
+        already exhausted, or a hop is NO_MATCH (no recognizable match at all).
         """
         if self._seg_idx >= len(self._segments):
             return False
@@ -452,18 +476,17 @@ class TextSegmentMap:
         remaining_word = word
 
         while remaining_word and seg_idx < len(self._segments):
-            segment_remaining = self._segments[seg_idx].tts[raw_pos:]
-            kind, _skip, value = self._classify_hop(segment_remaining, remaining_word)
+            hop = self._classify_hop(self._segments[seg_idx].tts[raw_pos:], remaining_word)
 
-            if kind == "found":
+            if hop.kind is _HopKind.PLACED:
                 return True
-            if kind == "consume":
-                if value:
-                    remaining_word = remaining_word[value:]
-                seg_idx += 1
-                raw_pos = 0
-                continue
-            return False
+            if hop.kind is _HopKind.NO_MATCH:
+                return False
+
+            # CROSSES or EXHAUSTED: keep hopping into the next segment.
+            remaining_word = remaining_word[hop.word_chars :]
+            seg_idx += 1
+            raw_pos = 0
 
         return True
 

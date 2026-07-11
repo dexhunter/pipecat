@@ -7,6 +7,7 @@
 import unittest
 
 from pipecat.utils.context.word_completion_tracker import WordCompletionTracker
+from pipecat.utils.text.transforms._alnum_utils import normalize
 
 
 class TestWordCompletionTrackerBasic(unittest.TestCase):
@@ -1658,11 +1659,11 @@ class TestWordCompletionTrackerCJK(unittest.TestCase):
         samples = ["저는여러분의", "안녕하세요", "어시스턴트"]
         for text in samples:
             raw_count = sum(1 for c in text if c.isalnum())
-            norm_count = len(WordCompletionTracker._normalize(text))
+            norm_count = len(normalize(text))
             self.assertEqual(
                 norm_count,
                 raw_count,
-                f"_normalize({text!r}): got {norm_count} chars, want {raw_count}",
+                f"normalize({text!r}): got {norm_count} chars, want {raw_count}",
             )
 
     def test_korean_force_complete_remaining_text_is_correct(self):

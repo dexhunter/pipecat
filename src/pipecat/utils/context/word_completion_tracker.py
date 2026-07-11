@@ -12,7 +12,6 @@ import unicodedata
 from loguru import logger
 
 from pipecat.utils.context.text_segment_map import TextSegmentMap, strip_markup
-from pipecat.utils.text.transforms._alnum_utils import normalize as _normalize_fn
 
 
 class WordCompletionTracker:
@@ -119,16 +118,6 @@ class WordCompletionTracker:
         self._force_completed = False
 
         self._segment_map = TextSegmentMap(tts_text, self._user_facing_text, llm_text)
-
-    @staticmethod
-    def _normalize(text: str) -> str:
-        """Strip XML/HTML tags then keep only lowercase alphanumeric characters.
-
-        Delegates to :func:`pipecat.utils.text.transforms._alnum_utils.normalize`.
-        Kept as a static method for backward compatibility with callers that reference
-        ``WordCompletionTracker._normalize`` directly.
-        """
-        return _normalize_fn(text)
 
     # Typographic variants that LLMs commonly emit but TTS services normalize away.
     _TYPOGRAPHY_FOLD = str.maketrans(

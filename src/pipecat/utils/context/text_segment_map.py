@@ -8,66 +8,62 @@
 
 import difflib
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum, auto
 
 from pipecat.utils.text.transforms._alnum_utils import advance_by_alnums, normalize
 
 
+def _iter_clean_chars(text: str) -> Iterator[tuple[int, str]]:
+    """Yield ``(raw_index, char)`` for each character of *text* outside markup.
+
+    The single definition of "what is markup" -- anything between '<' and '>',
+    syntax-based and tag-name independent -- shared by :func:`strip_markup` and
+    :func:`_raw_len_for_clean_chars` so the two can't disagree. An unclosed '<'
+    swallows the rest of the string (matching how word-timestamp fragments can
+    arrive mid-tag).
+    """
+    in_tag = False
+    for i, ch in enumerate(text):
+        if in_tag:
+            if ch == ">":
+                in_tag = False
+        elif ch == "<":
+            in_tag = True
+        else:
+            yield i, ch
+
+
 def strip_markup(text: str) -> str:
     """Remove XML/SSML-like markup from text without depending on tag names.
 
-    This is intentionally syntax-based, not tag-name based. It treats anything
-    between '<' and '>' as markup and preserves text outside markup.
+    Syntax-based, not tag-name based: treats anything between '<' and '>' as
+    markup and preserves text outside it.
 
     Module-level rather than private to either class below: both
     :class:`TextSegment` and :class:`TextSegmentMap` use it, and so does
     :class:`~pipecat.utils.context.word_completion_tracker.WordCompletionTracker`
     (to default ``user_facing_text`` to a tag-free string).
     """
-    result = []
-    in_tag = False
-
-    for ch in text:
-        if in_tag:
-            if ch == ">":
-                in_tag = False
-            continue
-
-        if ch == "<":
-            in_tag = True
-            continue
-
-        result.append(ch)
-
-    return "".join(result)
+    return "".join(ch for _, ch in _iter_clean_chars(text))
 
 
 def _raw_len_for_clean_chars(text: str, n: int) -> int:
-    """Return the raw offset into *text* after producing *n* markup-stripped chars.
+    """Return the raw offset into *text* just past its *n*-th markup-stripped char.
 
-    Stateless counterpart to :func:`strip_markup`: walks *text* the same way
-    (tracking ``<...>`` spans) but stops as soon as *n* non-markup characters
-    have been produced, instead of stripping the whole string. Used to convert
-    a match found in markup-stripped space back into a raw-text offset.
+    Inverse of :func:`strip_markup` for a prefix: where ``strip_markup`` collects
+    every non-markup char, this finds the raw index one past the *n*-th of them --
+    converting a match measured in markup-stripped space back to a raw offset.
+    Returns ``len(text)`` when *text* has fewer than *n* non-markup chars.
     """
     if n <= 0:
         return 0
-
-    produced = 0
-    in_tag = False
-    for pos, ch in enumerate(text):
-        if in_tag:
-            if ch == ">":
-                in_tag = False
-            continue
-        if ch == "<":
-            in_tag = True
-            continue
-        produced += 1
-        if produced == n:
-            return pos + 1
-
+    seen = 0
+    for i, _ in _iter_clean_chars(text):
+        seen += 1
+        if seen == n:
+            return i + 1
     return len(text)
 
 
